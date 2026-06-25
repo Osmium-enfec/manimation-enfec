@@ -1262,6 +1262,159 @@ def describe_drawing_animation_units(drawing_path: Path) -> list[dict[str, Any]]
     return out
 
 
+def _unit_center_x(info: AnimationUnitInfo) -> float | None:
+    if not info.bbox:
+        return None
+    return info.bbox[0] + info.bbox[2] / 2.0
+
+
+def _column_cluster_draw_order(infos: list[AnimationUnitInfo]) -> list[int]:
+    """Group units into visual columns (cards), then draw left-to-right, top-to-bottom."""
+    info_by_index = {info.index: info for info in infos}
+    border: list[int] = []
+    items: list[tuple[int, float, float]] = []
+    for info in infos:
+        if "slide border" in info.label.lower():
+            border.append(info.index)
+            continue
+        cx = _unit_center_x(info)
+        if cx is None:
+            continue
+        cy = info.bbox[1] if info.bbox else 0.0
+        items.append((info.index, cx, cy))
+
+    if len(items) < 2:
+        return [info.index for info in infos]
+
+    items.sort(key=lambda item: item[1])
+    gaps = [items[i + 1][1] - items[i][1] for i in range(len(items) - 1)]
+    positive_gaps = [gap for gap in gaps if gap > 1.0]
+    split_gap = max(80.0, sorted(positive_gaps)[len(positive_gaps) // 2] * 0.55) if positive_gaps else 120.0
+
+    columns: list[list[tuple[int, float, float]]] = [[items[0]]]
+    for item in items[1:]:
+        column_mean_x = sum(entry[1] for entry in columns[-1]) / len(columns[-1])
+        if item[1] - column_mean_x <= split_gap:
+            columns[-1].append(item)
+        else:
+            columns.append([item])
+
+    order: list[int] = []
+    for column in columns:
+        order.extend(idx for idx, _cx, _cy in sorted(column, key=lambda entry: (entry[2], entry[1], entry[0])))
+
+    seen = set(order)
+    for info in infos:
+        if info.index not in seen and info.index not in border:
+            order.append(info.index)
+    order.extend(border)
+    return order
+
+
+def _merged_text_anchors(infos: list[AnimationUnitInfo], *, merge_distance: float = 90.0) -> list[tuple[float, list[int]]]:
+    """Cluster speech-bubble + caption text on the same character into one column."""
+    anchors: list[tuple[float, list[int]]] = []
+    for info in infos:
+        if info.kind != "text":
+            continue
+        cx = _unit_center_x(info)
+        if cx is None or not info.bbox:
+            continue
+        cy = info.bbox[1]
+        if anchors:
+            prev_x, prev_idxs = anchors[-1][0], anchors[-1][1]
+            prev_info = next(item for item in infos if item.index == prev_idxs[-1])
+            prev_cy = prev_info.bbox[1] if prev_info.bbox else cy
+            if cx - prev_x < merge_distance and abs(cy - prev_cy) < 80.0:
+                anchors[-1] = ((prev_x + cx) / 2.0, prev_idxs + [info.index])
+                continue
+        anchors.append((cx, [info.index]))
+    return anchors
+
+
+def infer_spatial_draw_order(svg_path: Path) -> list[int]:
+    """Default draw order: left-to-right columns, connectors between characters."""
+    infos = describe_animation_units(svg_path)
+    if len(infos) < 2:
+        return [info.index for info in infos]
+
+    working = convert_svg_text_to_paths(svg_path)
+    try:
+        root = ET.parse(working).getroot()
+    except ET.ParseError:
+        return [info.index for info in infos]
+    units = animation_unit_elements_from_root(root)
+    connector_indices = {
+        i for i, unit in enumerate(units) if any(unit_connector_path_flags(unit))
+    }
+    info_by_index = {info.index: info for info in infos}
+
+    anchors = _merged_text_anchors(infos)
+    if len(anchors) < 2:
+        return _column_cluster_draw_order(infos)
+
+    anchor_xs = [item[0] for item in anchors]
+    column_count = len(anchors)
+    bounds: list[float] = []
+    for i in range(column_count - 1):
+        if i == column_count - 2:
+            bounds.append(anchor_xs[i] + 0.35 * (anchor_xs[i + 1] - anchor_xs[i]))
+        else:
+            bounds.append((anchor_xs[i] + anchor_xs[i + 1]) / 2.0)
+
+    def column_for(cx: float) -> int:
+        for i, bound in enumerate(bounds):
+            if cx < bound:
+                return i
+        return column_count - 1
+
+    buckets: list[list[int]] = [[] for _ in range(column_count)]
+    gaps: list[list[int]] = [[] for _ in range(column_count - 1)]
+    border: list[int] = []
+
+    for info in infos:
+        idx = info.index
+        if "slide border" in info.label.lower():
+            border.append(idx)
+            continue
+        cx = _unit_center_x(info)
+        if cx is None:
+            buckets[0].append(idx)
+            continue
+        if idx in connector_indices:
+            placed = False
+            for gap_i in range(column_count - 1):
+                if anchor_xs[gap_i] - 40.0 < cx < anchor_xs[gap_i + 1] + 40.0:
+                    gaps[gap_i].append(idx)
+                    placed = True
+                    break
+            if not placed:
+                buckets[column_for(cx)].append(idx)
+            continue
+        buckets[column_for(cx)].append(idx)
+
+    def bucket_sort_key(unit_index: int) -> tuple[float, float, int]:
+        info = info_by_index[unit_index]
+        return (
+            info.bbox[1] if info.bbox else 0.0,
+            _unit_center_x(info) or 0.0,
+            unit_index,
+        )
+
+    order: list[int] = []
+    for column_index in range(column_count):
+        order.extend(sorted(buckets[column_index], key=bucket_sort_key))
+        if column_index < len(gaps):
+            order.extend(sorted(gaps[column_index]))
+    order.extend(sorted(border))
+
+    seen = set(order)
+    for info in infos:
+        if info.index not in seen:
+            order.append(info.index)
+    return order
+
+
 def resolve_page_unit_order(
     page_index: int,
     unit_count: int,
@@ -1301,6 +1454,8 @@ def resolve_page_unit_order(
                 indices = [unit_map.get(id(elem), i) for i, elem in enumerate(reordered)]
                 if sorted(indices) == default:
                     return indices
+    if page_svg is not None and page_svg.is_file():
+        return infer_spatial_draw_order(page_svg)
     return default
 
 
@@ -1438,6 +1593,80 @@ def strip_invalid_svg_paths(svg_path: Path) -> Path:
     return _write_reordered_svg(svg_path, root, "sanitized")
 
 
+_CONNECTOR_FILL_COLORS = frozenset({"#e03131", "#c92a2a", "#c2255c"})
+
+
+def _mark_path_as_connector(path_elem: ET.Element) -> None:
+    path_elem.set("data-excal-connector", "true")
+
+
+def _path_in_text_glyph_group(
+    path_elem: ET.Element,
+    parent_map: dict[ET.Element, ET.Element],
+) -> bool:
+    cur: ET.Element | None = path_elem
+    while cur is not None:
+        if (cur.get("data-excal-text") or "").strip():
+            return True
+        cur = parent_map.get(cur)
+    return False
+
+
+def mark_excalidraw_connectors(svg_path: Path) -> Path:
+    """Tag dashed curves and arrow bodies so Manim can keep them above later strokes."""
+    try:
+        root = ET.parse(svg_path).getroot()
+    except ET.ParseError:
+        return svg_path
+
+    parent_map: dict[ET.Element, ET.Element] = {
+        child: parent for parent in root.iter() for child in parent
+    }
+    changed = False
+    for elem in root.iter():
+        if _local_tag(elem) != "path":
+            continue
+        if _path_in_text_glyph_group(elem, parent_map):
+            continue
+        if elem.get("data-excal-connector") == "true":
+            continue
+        if (elem.get("stroke-dasharray") or "").strip():
+            _mark_path_as_connector(elem)
+            changed = True
+            continue
+        fill = (elem.get("fill") or "").strip().lower()
+        stroke = (elem.get("stroke") or "none").strip().lower()
+        if fill in _CONNECTOR_FILL_COLORS and stroke in ("none", "transparent", ""):
+            if len(elem.get("d") or "") >= 180:
+                _mark_path_as_connector(elem)
+                changed = True
+
+    if not changed:
+        return svg_path
+    return _write_reordered_svg(svg_path, root, "connectors")
+
+
+def unit_connector_path_flags(unit: ET.Element) -> list[bool]:
+    """Return one connector flag per drawable path inside an animation unit."""
+    parent_map: dict[ET.Element, ET.Element] = {
+        child: parent for parent in unit.iter() for child in parent
+    }
+    flags: list[bool] = []
+    for child in unit.iter():
+        if _local_tag(child) != "path":
+            continue
+        if len(child.get("d") or "") <= 5:
+            continue
+        if _path_in_text_glyph_group(child, parent_map):
+            flags.append(False)
+            continue
+        flags.append(
+            child.get("data-excal-connector") == "true"
+            or bool((child.get("stroke-dasharray") or "").strip())
+        )
+    return flags
+
+
 def prepare_svg_for_manim(
     svg_path: Path,
     animation_sequence: list[str] | None = None,
@@ -1446,6 +1675,7 @@ def prepare_svg_for_manim(
     """Return an SVG ready for SVGMobject: text as paths, optional draw-order."""
     converted = convert_svg_text_to_paths(svg_path)
     converted = strip_invalid_svg_paths(converted)
+    converted = mark_excalidraw_connectors(converted)
     # Per-page unit_order is applied at animation time only; reordering the SVG DOM
     # here shifts raster placement and breaks icon alignment in cells.
     if animation_sequence and not unit_order:
@@ -2117,14 +2347,47 @@ def animation_unit_elements(svg_path: Path) -> list[ET.Element]:
     return animation_unit_elements_from_root(root)
 
 
+def _is_non_animatable_unit(elem: ET.Element, vb: tuple[float, float, float, float]) -> bool:
+    """Skip auto-inserted borders and empty groups from draw-order indexing."""
+    if _element_has_raster_image(elem) or _element_text_label(elem):
+        return False
+
+    path_weight = _element_path_weight(elem)
+    if path_weight > 0:
+        return False
+
+    _, _, vb_w, vb_h = vb
+    vb_area = max(vb_w * vb_h, 1.0)
+    area = 0.0
+    for child in elem.iter():
+        if _local_tag(child) == "rect":
+            area = max(area, _float_attr(child, "width") * _float_attr(child, "height"))
+
+    fill, stroke = _element_unit_colors(elem)
+    if not fill and stroke and area >= vb_area * 0.15:
+        return True
+
+    return area <= 0.0
+
+
+def _filter_animatable_units(
+    units: list[ET.Element],
+    vb: tuple[float, float, float, float],
+) -> list[ET.Element]:
+    return [unit for unit in units if not _is_non_animatable_unit(unit, vb)]
+
+
 def animation_unit_elements_from_root(root: ET.Element) -> list[ET.Element]:
     """Ordered animation units from an already-parsed SVG root."""
+    vb = parse_view_box(root)
     container = animation_unit_container(root)
     if container is None:
-        return _drawable_root_children(root)
-    if container is root:
-        return _drawable_root_children(root)
-    return _container_drawable_children(container, root)
+        units = _drawable_root_children(root)
+    elif container is root:
+        units = _drawable_root_children(root)
+    else:
+        units = _container_drawable_children(container, root)
+    return _filter_animatable_units(units, vb)
 
 
 def _element_has_raster_image(elem: ET.Element) -> bool:

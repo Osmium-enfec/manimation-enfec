@@ -272,7 +272,12 @@ def _prepare_render(
         skip = True
     else:
         skip = project.get("code_customized", False)
-        if not skip and project.get("beats"):
+        if _is_excalidraw(project):
+            phase(2, "Compiling Excalidraw scene")
+            _compile_excalidraw_project(project_id, project)
+            store.save_project(project, snapshot=False)
+            skip = True
+        elif not skip and project.get("beats"):
             phase(1, "Resolving visuals")
             project = _resolve_and_prefetch(project)
             store.save_project(project, snapshot=False)

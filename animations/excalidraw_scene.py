@@ -11,6 +11,8 @@ from typing import Any
 from manim import *
 import numpy as np
 
+from manim.utils.rate_functions import smooth
+
 from excalidraw_parser import (
     ExcalidrawPage,
     SvgImagePlacement,
@@ -37,12 +39,87 @@ from excalidraw_parser import (
     resolve_page_unit_order,
     strip_embedded_image_uses,
     svg_canvas_background_color,
+    unit_connector_path_flags,
     unit_path_layer_count,
 )
 
 # Excalidraw Y-down → Manim Y-up
 _EXCAL_SCALE = 0.012
-_ICON_REVEAL_TIME = 1.0
+_IMAGE_REVEAL_MIN = 0.55
+_IMAGE_REVEAL_MAX = 1.05
+
+
+def _image_reveal_run_time(run_time: float) -> float:
+    """Gentle image fade duration that scales with scene budget."""
+    return max(_IMAGE_REVEAL_MIN, min(_IMAGE_REVEAL_MAX, run_time * 1.15))
+
+
+def _restore_vector_opacity(mob: Mobject) -> None:
+    """Restore vector opacity so fade/draw animations interpolate to a visible end state."""
+    for sm in mob.get_family():
+        if isinstance(sm, ImageMobject) or _is_embedded_icon(sm):
+            continue
+        sm.set_opacity(1)
+
+
+def _image_reveal_animation(image: Mobject) -> Animation:
+    """Opacity fade for raster images (FadeIn breaks when the target starts at opacity 0)."""
+    image.set_opacity(0)
+    return image.animate.set_opacity(1)
+
+
+def _play_image_layer(
+    scene: Scene,
+    layer: Mobject,
+    image_target: Mobject,
+    *,
+    run_time: float,
+) -> None:
+    if layer not in scene.mobjects:
+        scene.add(layer)
+    if isinstance(image_target, ImageMobject):
+        scene.play(
+            _image_reveal_animation(image_target),
+            run_time=_image_reveal_run_time(run_time),
+            rate_func=smooth,
+        )
+        return
+    _restore_vector_opacity(image_target)
+    scene.play(
+        FadeIn(image_target, rate_func=smooth),
+        run_time=_image_reveal_run_time(run_time),
+    )
+
+
+def _hide_draw_group(group: Mobject) -> None:
+    """Hide every drawable part before the sequence reveals them one step at a time."""
+    svg_root = _svg_vector_root(group)
+    if svg_root is not None:
+        for mob in svg_root.get_family():
+            if isinstance(mob, ImageMobject):
+                continue
+            if _is_cell_background(mob, svg_root) or _is_background_fill(mob, svg_root):
+                continue
+            mob.set_opacity(0)
+    for wrapper in _collect_icon_wrappers(group).values():
+        _hide_layer_for_sequence(wrapper)
+
+
+def _ensure_draw_group_on_scene(scene: Scene, group: Mobject) -> None:
+    svg_root = _svg_vector_root(group)
+    if svg_root is not None and svg_root not in scene.mobjects:
+        scene.add(svg_root)
+
+
+def _image_reveal_target(layer: Mobject) -> Mobject | None:
+    """Return the raster image to fade in, if this layer is image-based."""
+    if _is_embedded_icon(layer):
+        return layer
+    if _is_icon_wrapper(layer):
+        return layer.submobjects[0]
+    if isinstance(layer, (VGroup, Group)) and len(layer.submobjects) == 1:
+        return _image_reveal_target(layer.submobjects[0])
+    return None
 
 
 def _is_embedded_icon(mob: Mobject) -> bool:
@@ -241,9 +318,70 @@ def _glyph_reveal_animation(glyph: VMobject) -> Animation:
     return Create(glyph)
 
 
-def _play_text_typing_layer(scene: Scene, layer: Mobject, *, run_time: float) -> bool:
+def _split_unit_stroke_layers(
+    unit: ET.Element,
+    strokes: list[Mobject],
+) -> tuple[list[Mobject], list[Mobject]]:
+    """Separate connector/arrow strokes from text or illustration strokes in one unit."""
+    flags = unit_connector_path_flags(unit)
+    if not flags or len(flags) != len(strokes):
+        return strokes, []
+
+    text_like: list[Mobject] = []
+    connectors: list[Mobject] = []
+    for is_connector, stroke in zip(flags, strokes):
+        if is_connector:
+            connectors.append(stroke)
+        else:
+            text_like.append(stroke)
+    return text_like, connectors
+
+
+def _hide_layer_for_sequence(mob: Mobject) -> None:
+    """Keep later sequence steps invisible until their turn."""
+    for sm in mob.get_family():
+        if isinstance(sm, ImageMobject):
+            sm.set_opacity(0)
+            sm.set_fill_opacity(0)
+        else:
+            sm.set_opacity(0)
+
+
+def _finalize_layer_reveal(mob: Mobject) -> None:
+    """Lock one sequence step to fully opaque before the next step starts."""
+    for sm in mob.get_family():
+        if isinstance(sm, ImageMobject):
+            sm.set_opacity(1)
+            sm.set_fill_opacity(1)
+        else:
+            sm.set_opacity(1)
+
+
+def _connector_reveal_animation(layer: Mobject) -> Animation:
+    """Reveal dashed Excalidraw connectors during their sequence step."""
+    if isinstance(layer, VGroup):
+        parts = [
+            DashedVMobject(sm, num_dashes=14, dashed_ratio=0.42)
+            if isinstance(sm, VMobject) and float(sm.get_stroke_opacity() or 0) > 0.05
+            else sm
+            for sm in layer.submobjects
+        ]
+        return Create(VGroup(*parts))
+
+    if isinstance(layer, VMobject) and float(layer.get_stroke_opacity() or 0) > 0.05:
+        _ensure_visible_stroke(layer, min_width=2.5)
+        return Create(DashedVMobject(layer, num_dashes=14, dashed_ratio=0.42))
+
+    return Create(layer)
+
+
+def _play_text_typing_layer(
+    scene: Scene,
+    layer: Mobject,
+    *,
+    run_time: float,
+) -> bool:
     """Reveal converted Excalidraw text glyph-by-glyph."""
-    layer.set_z_index(1)
     if isinstance(layer, VGroup):
         glyphs = [
             sm
@@ -258,8 +396,12 @@ def _play_text_typing_layer(scene: Scene, layer: Mobject, *, run_time: float) ->
     if not glyphs:
         return False
 
+    for glyph in glyphs:
+        _restore_vector_opacity(glyph)
+
     if len(glyphs) == 1:
         scene.play(_glyph_reveal_animation(glyphs[0]), run_time=run_time)
+        _finalize_layer_reveal(layer)
         return True
 
     glyphs = _sort_text_glyphs(glyphs)
@@ -268,14 +410,12 @@ def _play_text_typing_layer(scene: Scene, layer: Mobject, *, run_time: float) ->
         LaggedStart(*[_glyph_reveal_animation(g) for g in glyphs], lag_ratio=lag),
         run_time=max(run_time, len(glyphs) * 0.035),
     )
+    _finalize_layer_reveal(layer)
     return True
 
 
 def _set_hidden_for_reveal(mob: Mobject) -> None:
-    if isinstance(mob, ImageMobject):
-        mob.set_fill_opacity(0)
-    else:
-        mob.set_opacity(0)
+    _hide_layer_for_sequence(mob)
 
 
 def _play_animation_layer(
@@ -288,51 +428,69 @@ def _play_animation_layer(
     if getattr(layer, "excal_is_text_unit", False):
         if _play_text_typing_layer(scene, layer, run_time=run_time):
             return
-    if _is_embedded_icon(layer) or _is_icon_wrapper(layer):
-        reveal = layer.submobjects[0] if _is_icon_wrapper(layer) else layer
-        _set_hidden_for_reveal(reveal)
-        layer.set_z_index(10)
-        if layer not in scene.mobjects:
-            scene.add(layer)
-        scene.play(
-            FadeIn(reveal, scale=1.02),
-            run_time=max(run_time, _ICON_REVEAL_TIME),
-        )
+    if getattr(layer, "excal_is_connector", False):
+        _restore_vector_opacity(layer)
+        scene.play(_connector_reveal_animation(layer), run_time=run_time)
+        _finalize_layer_reveal(layer)
+        return
+    image_target = _image_reveal_target(layer)
+    if image_target is not None:
+        _play_image_layer(scene, layer, image_target, run_time=run_time)
+        _finalize_layer_reveal(layer)
         return
     elif isinstance(layer, VMobject) and layer.get_num_points() > 0:
-        layer.set_z_index(1)
         has_stroke = float(layer.get_stroke_opacity() or 0) > 0.05 and float(layer.get_stroke_width() or 0) > 0
         has_fill = float(layer.get_fill_opacity() or 0) > 0.05
+        _restore_vector_opacity(layer)
         if has_stroke:
             _ensure_visible_stroke(layer)
         if has_fill and not has_stroke and _is_solid_panel_fill(layer, svg_root):
-            layer.set_opacity(1)
             if layer not in scene.mobjects:
                 scene.add(layer)
+            scene.play(FadeIn(layer, rate_func=smooth), run_time=run_time * 0.75)
+            _finalize_layer_reveal(layer)
             return
         if has_stroke and not has_fill:
-            scene.play(FadeIn(layer), run_time=run_time * 0.85)
+            scene.play(FadeIn(layer, rate_func=smooth), run_time=run_time * 0.9)
         else:
             scene.play(Create(layer), run_time=run_time)
+        _finalize_layer_reveal(layer)
     elif isinstance(layer, VGroup) and layer.submobjects:
-        layer.set_z_index(1)
-        strokes = [
-            sm
-            for sm in layer.submobjects
-            if isinstance(sm, VMobject) and sm.get_num_points() > 0
-        ]
-        if strokes:
-            for sm in strokes:
-                if float(sm.get_stroke_opacity() or 0) > 0.05:
-                    _ensure_visible_stroke(sm)
+        anims: list[Animation] = []
+        for sm in layer.submobjects:
+            nested_image = _image_reveal_target(sm)
+            if nested_image is not None:
+                if sm not in scene.mobjects:
+                    scene.add(sm)
+                if isinstance(nested_image, ImageMobject):
+                    nested_image.set_opacity(0)
+                    anims.append(nested_image.animate.set_opacity(1))
+                else:
+                    _restore_vector_opacity(nested_image)
+                    anims.append(FadeIn(nested_image, rate_func=smooth))
+                continue
+            if not isinstance(sm, VMobject) or sm.get_num_points() <= 0:
+                continue
+            _restore_vector_opacity(sm)
+            if float(sm.get_stroke_opacity() or 0) > 0.05:
+                _ensure_visible_stroke(sm)
+            has_stroke = float(sm.get_stroke_opacity() or 0) > 0.05 and float(sm.get_stroke_width() or 0) > 0
+            has_fill = float(sm.get_fill_opacity() or 0) > 0.05
+            if has_stroke and not has_fill:
+                anims.append(FadeIn(sm, rate_func=smooth))
+            else:
+                anims.append(Create(sm))
+        if anims:
             scene.play(
-                AnimationGroup(*[FadeIn(sm) for sm in strokes], lag_ratio=0),
-                run_time=run_time * 0.85,
+                AnimationGroup(*anims, lag_ratio=0),
+                run_time=max(run_time * 0.9, _image_reveal_run_time(run_time) if len(anims) == 1 else run_time * 0.9),
+                rate_func=smooth,
             )
-        else:
-            scene.play(FadeIn(layer, shift=0.05 * UP), run_time=run_time * 0.85)
+        _finalize_layer_reveal(layer)
     elif isinstance(layer, Mobject):
-        scene.play(FadeIn(layer, shift=0.05 * UP), run_time=run_time * 0.85)
+        _restore_vector_opacity(layer)
+        scene.play(FadeIn(layer, rate_func=smooth), run_time=run_time * 0.9)
+        _finalize_layer_reveal(layer)
 
 
 def _svg_vector_root(group: Mobject) -> Mobject | None:
@@ -354,8 +512,10 @@ def _play_draw_layers(
     _add_panel_backgrounds(scene, group)
     layers = _animation_layers(group)
     svg_root = _svg_vector_root(group)
+    _ensure_draw_group_on_scene(scene, group)
+    _hide_draw_group(group)
     n = max(len(layers), 1)
-    per = max(0.08, (total_run_time - hold_time) / n)
+    per = max(0.12, (total_run_time - hold_time) / n)
 
     for layer in layers:
         _play_animation_layer(scene, layer, run_time=per, svg_root=svg_root)
@@ -401,7 +561,9 @@ def _animate_svg_pages(
         layers = _animation_layers(group)
         svg_root = _svg_vector_root(group)
         layer_count = max(len(layers), 1)
-        per = max(0.08, draw_budget / layer_count)
+        per = max(0.12, draw_budget / layer_count)
+        _ensure_draw_group_on_scene(scene, group)
+        _hide_draw_group(group)
         for layer in layers:
             _play_animation_layer(scene, layer, run_time=per, svg_root=svg_root)
 
@@ -457,7 +619,7 @@ def _animate_excalidraw_json_pages(
             scene.play(FadeOut(current), run_time=transition)
 
         layer_count = max(len(parts), 1)
-        per = max(0.08, draw_budget / layer_count)
+        per = max(0.12, draw_budget / layer_count)
         for mob in parts:
             if isinstance(mob, VMobject) and mob.get_num_points() > 0:
                 if float(mob.get_stroke_width() or 0) > 0:
@@ -887,7 +1049,7 @@ def _attach_raster_icons(
 
         img.excal_placement = placement
         img.excal_unit_index = placement.unit_index
-        img.set_fill_opacity(0)
+        img.set_opacity(0)
         attached.append(Group(img))
     return attached
 
@@ -1168,18 +1330,40 @@ def _animation_layers(group: Mobject) -> list[Mobject]:
 
             draw_order = _resolve_draw_order(unit_order, len(units))
             for unit_index in draw_order:
-                if unit_index in icon_before_text:
-                    layers.append(icon_before_text[unit_index])
-                if unit_index in orphan_icons:
-                    layers.append(orphan_icons[unit_index])
                 if unit_index in shadowed_vectors:
                     continue
+                unit_parts: list[Mobject] = []
+                if unit_index in icon_before_text:
+                    unit_parts.append(icon_before_text[unit_index])
+                if unit_index in orphan_icons:
+                    unit_parts.append(orphan_icons[unit_index])
                 start, end = stroke_ranges[unit_index]
                 if start < end:
-                    layer = _unit_stroke_layer(all_strokes[start:end])
-                    if _is_text_animation_unit(units[unit_index]):
-                        layer.excal_is_text_unit = True
-                    layers.append(layer)
+                    unit_strokes = all_strokes[start:end]
+                    text_strokes, connector_strokes = _split_unit_stroke_layers(
+                        units[unit_index],
+                        unit_strokes,
+                    )
+                    if text_strokes:
+                        layer = _unit_stroke_layer(text_strokes)
+                        if _is_text_animation_unit(units[unit_index]):
+                            layer.excal_is_text_unit = True
+                        unit_parts.append(layer)
+                    if connector_strokes:
+                        connector_layer = _unit_stroke_layer(connector_strokes)
+                        connector_layer.excal_is_connector = True
+                        unit_parts.append(connector_layer)
+                if not unit_parts:
+                    continue
+                if len(unit_parts) == 1:
+                    layers.append(unit_parts[0])
+                    continue
+                combined = VGroup(*unit_parts)
+                if any(getattr(part, "excal_is_text_unit", False) for part in unit_parts):
+                    combined.excal_is_text_unit = True
+                if any(getattr(part, "excal_is_connector", False) for part in unit_parts):
+                    combined.excal_is_connector = True
+                layers.append(combined)
 
             if offset < len(all_strokes):
                 tail = all_strokes[offset:]
@@ -1339,6 +1523,7 @@ def _add_panel_backgrounds(scene: Scene, group: Mobject) -> None:
         for mob in root.get_family():
             if _is_cell_background(mob, root):
                 mob.set_opacity(1)
+                mob.set_z_index(0)
                 if mob not in scene.mobjects:
                     scene.add(mob)
 
@@ -1350,7 +1535,9 @@ def _resolve_unit_order(
     page_sequences: dict[int, list[int]] | None,
 ) -> list[int] | None:
     converted = convert_svg_text_to_paths(page_svg)
-    unit_count = len(animation_unit_elements(converted))
+    # Match the prepared render catalog so saved unit indices map to raster icons.
+    render_catalog = prepare_svg_for_manim(converted)
+    unit_count = len(animation_unit_elements(render_catalog))
     if unit_count < 2:
         return None
     has_saved = bool(

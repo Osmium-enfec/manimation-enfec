@@ -34,8 +34,35 @@ function kindLabel(kind: string) {
 }
 
 function orderFromPage(page: ExcalidrawPageUnits): number[] {
-  if (page.saved_order?.length) return [...page.saved_order];
+  const known = new Set(page.units.map((unit) => unit.index));
+  if (page.saved_order?.length) {
+    const saved = page.saved_order.filter((idx) => known.has(idx));
+    for (const unit of page.units) {
+      if (!saved.includes(unit.index)) saved.push(unit.index);
+    }
+    return saved;
+  }
   return page.units.map((unit) => unit.index);
+}
+
+function buildFullOrder(page: ExcalidrawPageUnits, currentOrder: number[]): number[] {
+  const known = new Set(page.units.map((unit) => unit.index));
+  const result: number[] = [];
+  for (const idx of currentOrder) {
+    if (known.has(idx)) result.push(idx);
+  }
+  for (const unit of page.units) {
+    if (!result.includes(unit.index)) result.push(unit.index);
+  }
+  return result;
+}
+
+function orderKey(order: number[]): string {
+  return order.join(",");
+}
+
+function ordersEqual(a: number[], b: number[]): boolean {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
 export function ExcalidrawSequenceEditor({
@@ -57,22 +84,57 @@ export function ExcalidrawSequenceEditor({
   const [hoveredUnitIndex, setHoveredUnitIndex] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const listItemRefs = useRef<Map<number, HTMLLIElement>>(new Map());
+  const skipAutoSaveRef = useRef(true);
+  const lastSavedKeyRef = useRef("");
+  const persistInFlightRef = useRef(false);
+  const pagesRef = useRef(pages);
+  pagesRef.current = pages;
 
   const activePage = pages[pageIndex];
 
   const orderedUnits = useMemo(() => {
     if (!activePage) return [] as ExcalidrawAnimationUnit[];
     const byIndex = new Map(activePage.units.map((unit) => [unit.index, unit]));
-    const result: ExcalidrawAnimationUnit[] = [];
-    for (const idx of order) {
-      const unit = byIndex.get(idx);
-      if (unit) result.push(unit);
-    }
-    for (const unit of activePage.units) {
-      if (!order.includes(unit.index)) result.push(unit);
-    }
-    return result;
+    const fullOrder = buildFullOrder(activePage, order);
+    return fullOrder
+      .map((idx) => byIndex.get(idx))
+      .filter((unit): unit is ExcalidrawAnimationUnit => unit != null);
   }, [activePage, order]);
+
+  const syncOrderState = useCallback((nextOrder: number[], options?: { skipAutoSave?: boolean }) => {
+    lastSavedKeyRef.current = orderKey(nextOrder);
+    setOrder((current) => (ordersEqual(current, nextOrder) ? current : nextOrder));
+    if (options?.skipAutoSave !== false) skipAutoSaveRef.current = true;
+  }, []);
+
+  const persistOrder = useCallback(
+    async (manual: boolean) => {
+      if (!activePage || persistInFlightRef.current) return;
+      const fullOrder = buildFullOrder(activePage, order);
+      const key = orderKey(fullOrder);
+      if (key === lastSavedKeyRef.current) return;
+
+      persistInFlightRef.current = true;
+      if (manual) setSaving(true);
+      setError(null);
+      try {
+        const res = await saveExcalidrawSequence(projectId, activePage.page_index, fullOrder);
+        lastSavedKeyRef.current = key;
+        onSaved(res.page_sequences, res.project, res.code);
+        setPages((current) =>
+          current.map((page) =>
+            page.page_index === activePage.page_index ? { ...page, saved_order: fullOrder } : page
+          )
+        );
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        persistInFlightRef.current = false;
+        if (manual) setSaving(false);
+      }
+    },
+    [activePage, onSaved, order, projectId]
+  );
 
   const loadUnits = useCallback(async () => {
     if (!drawingRef) {
@@ -87,28 +149,47 @@ export function ExcalidrawSequenceEditor({
       setPages(res.pages);
       const first = res.pages[0];
       setPageIndex(0);
-      setOrder(first ? orderFromPage(first) : []);
+      if (first) {
+        syncOrderState(orderFromPage(first));
+      } else {
+        syncOrderState([]);
+      }
       setSelectedUnitIndex(null);
     } catch (e) {
       setError(String(e));
     } finally {
       setLoading(false);
     }
-  }, [drawingRef, projectId]);
+  }, [drawingRef, projectId, syncOrderState]);
 
   useEffect(() => {
     void loadUnits();
   }, [loadUnits]);
 
   useEffect(() => {
-    if (!activePage) {
-      setOrder([]);
+    const page = pagesRef.current[pageIndex];
+    if (!page) {
+      syncOrderState([]);
       setSelectedUnitIndex(null);
       return;
     }
-    setOrder(orderFromPage(activePage));
+    syncOrderState(orderFromPage(page));
     setSelectedUnitIndex(null);
-  }, [activePage?.page_index, pages]);
+  }, [pageIndex, syncOrderState]);
+
+  useEffect(() => {
+    if (!activePage || skipAutoSaveRef.current) {
+      skipAutoSaveRef.current = false;
+      return;
+    }
+    const fullOrder = buildFullOrder(activePage, order);
+    if (orderKey(fullOrder) === lastSavedKeyRef.current) return;
+
+    const timer = window.setTimeout(() => {
+      void persistOrder(false);
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [order, activePage, persistOrder]);
 
   useEffect(() => {
     if (selectedUnitIndex == null) return;
@@ -178,27 +259,17 @@ export function ExcalidrawSequenceEditor({
 
   const handleReset = () => {
     if (!activePage) return;
-    setOrder(activePage.units.map((unit) => unit.index));
+    const documentOrder = activePage.units.map((unit) => unit.index);
+    skipAutoSaveRef.current = false;
+    setOrder(documentOrder);
   };
 
-  const handleApply = async () => {
-    if (!activePage) return;
-    setSaving(true);
-    setError(null);
-    try {
-      const res = await saveExcalidrawSequence(projectId, activePage.page_index, order);
-      onSaved(res.page_sequences, res.project, res.code);
-      setPages((current) =>
-        current.map((page) =>
-          page.page_index === activePage.page_index ? { ...page, saved_order: [...order] } : page
-        )
-      );
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSaving(false);
-    }
+  const handleApply = () => {
+    void persistOrder(true);
   };
+
+  const isDirty =
+    !!activePage && orderKey(buildFullOrder(activePage, order)) !== lastSavedKeyRef.current;
 
   if (!drawingRef) return null;
 
@@ -208,8 +279,7 @@ export function ExcalidrawSequenceEditor({
         <div className="excal-sequence-title-block">
           <strong>Draw order</strong>
           <span className="excal-sequence-subtitle">
-            Use the page canvas (right) or this list to match elements. Top draws first. Drag{" "}
-            <GripVertical size={12} className="inline-grip" /> or use ↑↓ to reorder.
+            Reorder draws for the active page. Changes save automatically; top draws first.
           </span>
         </div>
         {pages.length > 1 && (
@@ -349,8 +419,8 @@ export function ExcalidrawSequenceEditor({
       <div className="excal-sequence-toolbar">
         <button
           type="button"
-          className="btn-ghost sm"
-          disabled={disabled || saving || !activePage}
+          className="btn-ghost sm excal-sequence-toolbar-btn"
+          disabled={disabled || !activePage || !isDirty}
           onClick={handleReset}
           title="Restore SVG document order"
         >
@@ -359,12 +429,12 @@ export function ExcalidrawSequenceEditor({
         </button>
         <button
           type="button"
-          className="btn-primary sm"
-          disabled={disabled || saving || !activePage || orderedUnits.length < 2}
-          onClick={() => void handleApply()}
+          className="btn-primary sm excal-sequence-toolbar-btn excal-sequence-save-btn"
+          disabled={disabled || saving || !activePage || orderedUnits.length < 2 || !isDirty}
+          onClick={handleApply}
         >
           {saving ? <Loader2 size={13} className="spin" /> : null}
-          Apply order
+          <span>{saving ? "Saving…" : "Save now"}</span>
         </button>
       </div>
 

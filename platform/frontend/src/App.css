@@ -3258,6 +3258,18 @@ body.sidebar-resizing iframe {
   margin-top: 8px;
 }
 
+.excal-sequence-toolbar-btn {
+  min-width: 5.75rem;
+  justify-content: center;
+}
+
+.excal-sequence-save-btn {
+  min-width: 6.75rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .excal-sequence-empty {
   font-size: 11px;
   color: var(--muted);
