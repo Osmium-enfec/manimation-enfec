@@ -1667,13 +1667,94 @@ def unit_connector_path_flags(unit: ET.Element) -> list[bool]:
     return flags
 
 
+def _viewbox_has_anchor(
+    root: ET.Element,
+    vb_x: float,
+    vb_y: float,
+    vb_w: float,
+    vb_h: float,
+) -> bool:
+    for elem in root.iter():
+        if _local_tag(elem) != "rect":
+            continue
+        if elem.get("data-manim-viewport") == "true":
+            return True
+        w = _float_attr(elem, "width")
+        h = _float_attr(elem, "height")
+        if w < vb_w * 0.98 or h < vb_h * 0.98:
+            continue
+        x = _float_attr(elem, "x", vb_x)
+        y = _float_attr(elem, "y", vb_y)
+        if abs(x - vb_x) <= 1.0 and abs(y - vb_y) <= 1.0:
+            return True
+    return False
+
+
+def _fmt_svg_number(value: float) -> str:
+    return str(int(value)) if abs(value - int(value)) < 1e-6 else str(value)
+
+
+def normalize_svg_viewport(svg_path: Path) -> Path:
+    """Sync width/height to viewBox so Manim and browsers keep the correct aspect ratio."""
+    try:
+        root = ET.parse(svg_path).getroot()
+    except ET.ParseError:
+        return svg_path
+
+    vb_x, vb_y, vb_w, vb_h = parse_view_box(root)
+    if vb_w <= 0 or vb_h <= 0:
+        return svg_path
+
+    changed = False
+    width_text = _fmt_svg_number(vb_w)
+    height_text = _fmt_svg_number(vb_h)
+    if root.get("width") != width_text or root.get("height") != height_text:
+        root.set("width", width_text)
+        root.set("height", height_text)
+        changed = True
+    if root.get("preserveAspectRatio") != "xMidYMid meet":
+        root.set("preserveAspectRatio", "xMidYMid meet")
+        changed = True
+
+    if not _viewbox_has_anchor(root, vb_x, vb_y, vb_w, vb_h):
+        tag = root.tag
+        ns = tag[: tag.index("}") + 1] if "}" in tag else ""
+        anchor = ET.Element(f"{ns}rect")
+        anchor.set("x", _fmt_svg_number(vb_x))
+        anchor.set("y", _fmt_svg_number(vb_y))
+        anchor.set("width", width_text)
+        anchor.set("height", height_text)
+        anchor.set("fill", "none")
+        anchor.set("stroke", "none")
+        anchor.set("opacity", "0")
+        anchor.set("data-manim-viewport", "true")
+        insert_at = 0
+        for index, child in enumerate(root):
+            if _local_tag(child) in {"defs", "style"}:
+                insert_at = index + 1
+            else:
+                break
+        root.insert(insert_at, anchor)
+        changed = True
+
+    if not changed:
+        return svg_path
+
+    render_dir = svg_path.parent / ".excalidraw_render"
+    render_dir.mkdir(parents=True, exist_ok=True)
+    out = render_dir / f"{svg_path.stem}_viewport.svg"
+    out.write_text(ET.tostring(root, encoding="unicode"), encoding="utf-8")
+    return out
+
+
 def prepare_svg_for_manim(
     svg_path: Path,
     animation_sequence: list[str] | None = None,
     unit_order: list[int] | None = None,
 ) -> Path:
     """Return an SVG ready for SVGMobject: text as paths, optional draw-order."""
-    converted = convert_svg_text_to_paths(svg_path)
+    normalized = normalize_svg_viewport(svg_path)
+    converted = convert_svg_text_to_paths(normalized)
     converted = strip_invalid_svg_paths(converted)
     converted = mark_excalidraw_connectors(converted)
     # Per-page unit_order is applied at animation time only; reordering the SVG DOM

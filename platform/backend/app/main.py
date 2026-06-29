@@ -41,6 +41,7 @@ from app.excalidraw_parser import (  # noqa: E402
     convert_svg_text_to_paths,
     describe_drawing_animation_units,
     detect_svg_pages,
+    normalize_svg_viewport,
     parse_animation_sequence_phrases,
     resolve_page_unit_order,
 )
@@ -1053,7 +1054,7 @@ def get_excalidraw_page_preview(project_id: str, page_index: int):
     else:
         raise HTTPException(status_code=404, detail="Page not found.")
 
-    preview_svg = convert_svg_text_to_paths(page_svg)
+    preview_svg = normalize_svg_viewport(convert_svg_text_to_paths(page_svg))
     return FileResponse(preview_svg, media_type="image/svg+xml")
 
 

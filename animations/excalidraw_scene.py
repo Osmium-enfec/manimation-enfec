@@ -688,25 +688,32 @@ def _layout_excalidraw_group(group: Group, margin: float = 0.9) -> None:
     (
         page_origin,
         page_w,
-        _page_h,
+        page_h,
         scale_x,
         scale_y,
         vb_x,
         vb_y,
-        _vb_w,
-        _vb_h,
+        vb_w,
+        vb_h,
     ) = _viewbox_layout_metrics(vb, margin)
 
     svg = _svg_vector_root(group)
-    if svg is not None and svg.width > 0.001:
-        svg.scale(page_w / svg.width)
+    if svg is not None and svg.width > 0.001 and vb_w > 0:
+        scale_w = page_w / svg.width
+        scale_h = page_h / svg.height if svg.height > 0.001 and vb_h > 0 else scale_w
+        if abs(scale_w - scale_h) / max(scale_w, scale_h, 1e-9) > 0.015:
+            # Manim bbox aspect drifted from viewBox — trust the viewBox grid.
+            scale_factor = scale_x * vb_w / svg.width
+        else:
+            scale_factor = scale_w
+        svg.scale(scale_factor)
         svg.move_to(page_origin, aligned_edge=UL)
 
     for img in (sm for sm in group.get_family() if _is_embedded_icon(sm)):
         placement = getattr(img, "excal_placement", None)
         if placement is None:
             continue
-        _stretch_mobject_to_rect(
+        _fit_mobject_to_rect(
             img,
             placement.width * scale_x,
             placement.height * scale_y,
@@ -1065,12 +1072,11 @@ def _viewbox_page_size(vb_w: float, vb_h: float, margin: float) -> tuple[float, 
     return fh * vb_w / vb_h, fh
 
 
-def _stretch_mobject_to_rect(img: Mobject, target_w: float, target_h: float) -> None:
-    """Match an icon to the exact SVG placement width/height after viewBox scaling."""
-    if target_w <= 0 or target_h <= 0:
+def _fit_mobject_to_rect(img: Mobject, target_w: float, target_h: float) -> None:
+    """Fit a raster icon inside its SVG placement without distorting aspect ratio."""
+    if target_w <= 0 or target_h <= 0 or img.width <= 0 or img.height <= 0:
         return
-    img.stretch_to_fit_width(max(target_w, 0.01))
-    img.stretch_to_fit_height(max(target_h, 0.01))
+    img.scale(min(target_w / img.width, target_h / img.height))
 
 
 def _collect_embedded_icons(group: Mobject) -> dict[int, Mobject]:

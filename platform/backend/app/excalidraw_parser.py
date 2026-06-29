@@ -18,6 +18,7 @@ from excalidraw_parser import (  # noqa: E402
     detect_svg_pages,
     excalidraw_elements,
     load_scene_file,
+    normalize_svg_viewport,
     pages_from_excalidraw_file,
     pages_from_excalidraw_scene,
     parse_animation_sequence_phrases,
