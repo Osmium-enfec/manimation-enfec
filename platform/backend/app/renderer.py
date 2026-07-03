@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 
@@ -30,6 +31,20 @@ def _manim_python() -> str:
         if path.is_file():
             return str(path)
     return shutil.which("python") or sys.executable
+
+
+def _cleanup_partial_movies(quality_dir: Path) -> None:
+    """Delete Manim's per-render partial movie cache.
+
+    Every project renders a scene named ``generated_scene``, so all renders pile
+    into the same ``media/videos/generated_scene/<quality>/partial_movie_files``
+    tree. With ``flush_cache=False`` this grows without bound and eventually
+    fills the disk. The final combined MP4 has already been copied out by the
+    time we call this, so the partial clips are safe to remove.
+    """
+    pmf = quality_dir / "partial_movie_files"
+    if pmf.is_dir():
+        shutil.rmtree(pmf, ignore_errors=True)
 
 
 def detect_scene_class_from_file(scene_file: Path) -> str:
@@ -70,7 +85,10 @@ def _stream_process_output(
     parser: ManimProgressParser,
     progress_callback: ProgressCallback | None,
 ) -> str:
-    chunks: list[str] = []
+    # Keep only a bounded tail of the output. A verbose Manim render can emit a
+    # large amount of stdout, and we only ever use the tail (for error context),
+    # so accumulating the whole stream would waste memory on every render.
+    tail: deque[str] = deque(maxlen=500)
     buffer = ""
     assert proc.stdout is not None
 
@@ -78,17 +96,17 @@ def _stream_process_output(
         ch = proc.stdout.read(1)
         if not ch:
             if buffer.strip():
-                chunks.append(buffer)
+                tail.append(buffer)
                 _emit_progress(parser, progress_callback, buffer)
             break
         buffer += ch
         if ch in "\r\n":
-            chunks.append(buffer)
+            tail.append(buffer)
             _emit_progress(parser, progress_callback, buffer)
             buffer = ""
 
     proc.wait()
-    return "".join(chunks)
+    return "".join(tail)
 
 
 def render_scene(
@@ -168,9 +186,11 @@ def render_scene(
         shutil.copy2(mp4, target)
         if staging_mp4 and staging_mp4 != output_mp4:
             staging_mp4.replace(output_mp4)
+        _cleanup_partial_movies(mp4.parent)
         if progress_callback:
             progress_callback(100, "Complete")
         return output_mp4
+    _cleanup_partial_movies(mp4.parent)
     if progress_callback:
         progress_callback(100, "Complete")
     return mp4

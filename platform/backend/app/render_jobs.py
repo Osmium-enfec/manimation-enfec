@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 from datetime import datetime, timezone
@@ -16,6 +17,13 @@ RenderFn = Callable[[ProgressCallback | None], None]
 _locks: dict[str, threading.Lock] = {}
 _registry_lock = threading.Lock()
 _active_processes: dict[str, subprocess.Popen] = {}
+
+# Global cap on how many Manim renders may run at once. Each Manim subprocess
+# consumes a large amount of RAM (Cairo + NumPy + frame buffers), so without a
+# cap a handful of concurrent users can exhaust memory and take the box down.
+# Tune with MAX_CONCURRENT_RENDERS; default 2 is safe for a small droplet.
+_MAX_CONCURRENT_RENDERS = max(1, int(os.environ.get("MAX_CONCURRENT_RENDERS", "2")))
+_render_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_RENDERS)
 
 _STATUS_FILES: dict[JobKind, str] = {
     "preview": ".render_status.json",
@@ -150,7 +158,19 @@ def start_render_job(
                     phase=phase,
                 )
 
+        # Wait for a global render slot before launching the heavy Manim
+        # subprocess. If all slots are busy, surface a "Queued" phase so the
+        # frontend shows the job is waiting rather than stalled.
+        if not _render_slots.acquire(blocking=False):
+            if track_progress:
+                update_status(renders_dir, kind, status="rendering", phase="Queued", progress=0)
+            _render_slots.acquire()
+
         try:
+            # A job can be cancelled while it was waiting for a slot; skip the
+            # expensive render entirely if so.
+            if read_status(renders_dir, kind).get("status") == "cancelled":
+                return
             render_fn(progress_cb if track_progress else None)
             current = read_status(renders_dir, kind)
             if current.get("status") == "cancelled":
@@ -177,6 +197,7 @@ def start_render_job(
                 failed["phase"] = "Failed"
             write_status(renders_dir, kind, failed)
         finally:
+            _render_slots.release()
             unregister_active_process(project_id, kind)
             lock.release()
 
