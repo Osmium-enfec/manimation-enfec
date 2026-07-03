@@ -11,6 +11,7 @@ services:
 
     ports:
       - "8088:80"
+    mem_limit: 4g
 
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
