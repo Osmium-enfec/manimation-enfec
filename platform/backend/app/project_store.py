@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import uuid
@@ -10,9 +11,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_DATA_DIR = Path(
     os.environ.get("MANIMATIONS_DATA_DIR", Path.home() / "manimations-studio")
 )
+DEFAULT_MAX_PROJECTS = max(1, int(os.environ.get("MANIMATIONS_MAX_PROJECTS", "10")))
 
 
 def _now_iso() -> str:
@@ -20,13 +24,57 @@ def _now_iso() -> str:
 
 
 class ProjectStore:
-    def __init__(self, data_dir: Path | None = None):
+    def __init__(self, data_dir: Path | None = None, *, max_projects: int | None = None):
         self.data_dir = Path(data_dir or DEFAULT_DATA_DIR)
         self.projects_dir = self.data_dir / "projects"
         self.projects_dir.mkdir(parents=True, exist_ok=True)
+        self.max_projects = max(1, max_projects if max_projects is not None else DEFAULT_MAX_PROJECTS)
+        self.prune_old_projects()
 
     def _project_dir(self, project_id: str) -> Path:
         return self.projects_dir / project_id
+
+    def _project_created_at(self, project_dir: Path) -> str:
+        meta_path = project_dir / "project.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+                created_at = str(meta.get("created_at") or "").strip()
+                if created_at:
+                    return created_at
+            except (json.JSONDecodeError, OSError):
+                pass
+        return datetime.fromtimestamp(project_dir.stat().st_mtime, tz=timezone.utc).isoformat()
+
+    def _sorted_project_dirs_oldest_first(self) -> list[Path]:
+        dirs = [
+            d
+            for d in self.projects_dir.iterdir()
+            if d.is_dir() and (d / "project.json").exists()
+        ]
+        return sorted(dirs, key=self._project_created_at)
+
+    def prune_old_projects(self, *, max_projects: int | None = None) -> list[str]:
+        """Keep only the newest N projects; delete older ones from disk."""
+        limit = max(1, max_projects if max_projects is not None else self.max_projects)
+        project_dirs = self._sorted_project_dirs_oldest_first()
+        deleted: list[str] = []
+        while len(project_dirs) > limit:
+            oldest = project_dirs.pop(0)
+            project_id = oldest.name
+            try:
+                self.delete_project(project_id)
+                deleted.append(project_id)
+                logger.info("Pruned old project %s (limit=%s)", project_id, limit)
+            except FileNotFoundError:
+                continue
+        if deleted:
+            logger.info(
+                "Project retention: removed %s old project(s); keeping newest %s",
+                len(deleted),
+                limit,
+            )
+        return deleted
 
     def list_projects(self) -> list[dict]:
         out = []
@@ -89,6 +137,7 @@ class ProjectStore:
             project["code_customized"] = True
             project["excalidraw"] = None
         self.save_project(project, snapshot=False)
+        self.prune_old_projects()
         return project
 
     def load_project(self, project_id: str) -> dict:
